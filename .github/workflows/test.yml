@@ -11,7 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run bats
+      - name: Install bats
         run: |
-          chmod +x tests/bats/bin/bats
-          tests/bats/bin/bats tests/security.bats
+          git clone --depth 1 https://github.com/bats-core/bats-core.git /tmp/bats
+          sudo /tmp/bats/install.sh /usr/local
+
+      - name: Run bats
+        run: bats tests/security.bats
