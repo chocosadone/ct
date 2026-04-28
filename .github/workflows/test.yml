@@ -1,0 +1,17 @@
+name: bats-test
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run bats
+        run: |
+          chmod +x tests/bats/bin/bats
+          tests/bats/bin/bats tests/security.bats

@@ -102,4 +102,10 @@ bash src/ct add skill '../foo'        # → "invalid name" で終了すること
 # 2 プロセスから同時に ct add / ct sync を実行してもマニフェストが破損しないこと
 ```
 
-自動テストスイートは現時点では存在しない。変更後は上記コマンドと実際の add/remove/sync を手動で確認する。
+自動テスト（セキュリティ強化の受け入れテスト）は `tests/security.bats` にある。以下で実行できる。
+
+```bash
+bats tests/security.bats
+```
+
+変更後は上記自動テストに加えて、実際の add/remove/sync を手動で確認する。
