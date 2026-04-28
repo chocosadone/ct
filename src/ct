@@ -1,0 +1,566 @@
+#!/usr/bin/env bash
+# ct - Claude Tools manager
+# Manage skills/plugins by copying from a central source to project or global .claude/
+
+set -euo pipefail
+
+# ---------- Config ----------
+CT_HOME="${CT_HOME:-$HOME/.claude-tools}"
+GLOBAL_CLAUDE_DIR="${GLOBAL_CLAUDE_DIR:-$HOME/.claude}"
+MANIFEST_NAME=".ct-manifest.json"
+CT_VERSION="0.1.0"
+
+# ---------- Colors ----------
+if [[ -t 1 ]]; then
+  C_RED=$'\e[31m'; C_GRN=$'\e[32m'; C_YLW=$'\e[33m'
+  C_BLU=$'\e[34m'; C_DIM=$'\e[2m'; C_RST=$'\e[0m'
+else
+  C_RED=""; C_GRN=""; C_YLW=""; C_BLU=""; C_DIM=""; C_RST=""
+fi
+
+# ---------- Logging ----------
+err()  { echo "${C_RED}error:${C_RST} $*" >&2; }
+warn() { echo "${C_YLW}warn:${C_RST} $*" >&2; }
+info() { echo "${C_BLU}info:${C_RST} $*"; }
+ok()   { echo "${C_GRN}ok:${C_RST} $*"; }
+die()  { err "$*"; exit 1; }
+
+# ---------- Usage ----------
+usage() {
+  cat <<'EOF'
+ct - Claude Tools manager
+
+USAGE:
+  ct list                                      List items in source (~/.claude-tools)
+  ct list --installed [--global|--project P]   List managed items at destination
+  ct add <type> <name> [opts]                  Copy from source to destination
+  ct remove <type> <name> [opts]               Remove a managed item from destination
+  ct update <type> <name>                      git pull on the source item
+  ct update --all                              git pull on all git-managed source items
+  ct sync <type> <name> [opts]                 Re-copy (after update) to destination
+  ct register <type> <git-url> [--name N]      git clone into source
+  ct version                                   Show version
+  ct help                                      Show this help
+
+ARGS:
+  <type>   skill | plugin
+  <name>   directory name under ~/.claude-tools/<type>s/
+
+OPTIONS:
+  --global             Target ~/.claude/
+  --project <path>     Target <path>/.claude/ (default: current directory)
+  -f                   Overwrite on add
+  -y                   Skip confirmation on remove
+
+ENV:
+  CT_HOME              Source directory (default: ~/.claude-tools)
+  GLOBAL_CLAUDE_DIR    Global target (default: ~/.claude)
+EOF
+}
+
+# ---------- Helpers ----------
+
+validate_name() {
+  local name="$1"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid name: $name (allowed: A-Z a-z 0-9 . _ -)"
+}
+
+json_escape() {
+  local s="$1"
+  case "$s" in *$'\n'*) die "value contains newline (unsupported)";; esac
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+manifest_lock() {
+  local mf="$1"
+  exec 9>"${mf}.lock"
+  flock 9
+}
+
+# normalize <type> to plural directory name (skill -> skills, plugin -> plugins)
+type_dir() {
+  case "$1" in
+    skill|skills)   echo "skills" ;;
+    plugin|plugins) echo "plugins" ;;
+    *) die "invalid type: $1 (must be skill or plugin)" ;;
+  esac
+}
+
+# resolve destination root: prints absolute path of the .claude/<type-dir> directory
+# usage: resolve_dest <type-dir> <scope-flag> [<project-path>]
+# scope-flag: "global" or "project"
+resolve_dest() {
+  local tdir="$1" scope="$2" ppath="${3:-.}"
+  local base
+  if [[ "$scope" == "global" ]]; then
+    base="$GLOBAL_CLAUDE_DIR"
+  else
+    # absolutize
+    if [[ "$ppath" != /* ]]; then
+      ppath="$(cd "$ppath" 2>/dev/null && pwd)" || die "project path not found: $ppath"
+    fi
+    base="$ppath/.claude"
+  fi
+  echo "$base/$tdir"
+}
+
+# parse common scope options from "$@", sets: SCOPE, PROJECT_PATH, FORCE, ASSUME_YES
+# remaining positional args go to REST array
+parse_opts() {
+  SCOPE="project"
+  PROJECT_PATH="."
+  FORCE=0
+  ASSUME_YES=0
+  REST=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --global)  SCOPE="global"; shift ;;
+      --project)
+        [[ $# -ge 2 ]] || die "--project requires a path"
+        SCOPE="project"; PROJECT_PATH="$2"; shift 2 ;;
+      -f|--force) FORCE=1; shift ;;
+      -y|--yes)   ASSUME_YES=1; shift ;;
+      --) shift; while [[ $# -gt 0 ]]; do REST+=("$1"); shift; done ;;
+      -*) die "unknown option: $1" ;;
+      *)  REST+=("$1"); shift ;;
+    esac
+  done
+}
+
+# is the source item under git management?
+is_git_managed() {
+  local path="$1"
+  [[ -d "$path/.git" ]]
+}
+
+# ---------- Manifest (pure bash, simple key-value JSON) ----------
+# Format:
+# {
+#   "managed": {
+#     "name1": {"source": "...", "copied_at": "...", "git": true},
+#     "name2": {...}
+#   }
+# }
+#
+# We keep operations limited to: list keys, has key, set key (with sub-fields), delete key.
+# All values are simple strings/booleans. No nested complexity beyond above.
+
+manifest_path() {
+  local dest_type_dir="$1"  # e.g. /path/.claude/skills
+  echo "$dest_type_dir/$MANIFEST_NAME"
+}
+
+manifest_init_if_missing() {
+  local mf="$1"
+  if [[ ! -f "$mf" ]]; then
+    mkdir -p "$(dirname "$mf")"
+    echo '{"managed":{}}' > "$mf"
+  fi
+}
+
+# List managed names from manifest, one per line.
+manifest_list_names() {
+  local mf="$1"
+  [[ -f "$mf" ]] || return 0
+  # Extract keys from "managed":{ "name": {...}, ... }
+  # We control the writer (one-line-per-entry), so a regex on each line is enough.
+  # Use POSIX awk (mawk-compatible): match() returns RSTART/RLENGTH, no capture arrays.
+  awk '
+    /"managed":[[:space:]]*\{/ { in_managed=1; next }
+    in_managed && /^[[:space:]]*\}[[:space:]]*\}[[:space:]]*$/ { in_managed=0; next }
+    in_managed {
+      # find a "name": {  on this line
+      if (match($0, /"[^"]+"[[:space:]]*:[[:space:]]*\{/)) {
+        s = substr($0, RSTART, RLENGTH)
+        # strip leading " and trailing "...  
+        if (match(s, /"[^"]+"/)) {
+          name = substr(s, RSTART+1, RLENGTH-2)
+          print name
+        }
+      }
+    }
+  ' "$mf"
+}
+
+# Get a specific field for a name; prints value or empty
+# usage: manifest_get_field <mf> <name> <field>
+manifest_get_field() {
+  local mf="$1" name="$2" field="$3"
+  [[ -f "$mf" ]] || return 0
+  awk -v name="$name" -v field="$field" '
+    function find_entry_body(line, key,    pat, s, idx, body, depth, i, ch) {
+      pat = "\"" key "\"[[:space:]]*:[[:space:]]*\\{"
+      if (!match(line, pat)) return ""
+      idx = RSTART + RLENGTH  # position right after the opening {
+      body = ""
+      depth = 1
+      for (i = idx; i <= length(line); i++) {
+        ch = substr(line, i, 1)
+        if (ch == "{") { depth++; body = body ch }
+        else if (ch == "}") {
+          depth--
+          if (depth == 0) return body
+          body = body ch
+        } else {
+          body = body ch
+        }
+      }
+      return ""
+    }
+    function extract_field(body, fname,    pat, s, val) {
+      pat = "\"" fname "\"[[:space:]]*:[[:space:]]*"
+      if (!match(body, pat)) return ""
+      s = substr(body, RSTART + RLENGTH)
+      # value is either "..." or true/false
+      if (match(s, /^"[^"]*"/)) {
+        val = substr(s, RSTART, RLENGTH)
+        # strip surrounding quotes
+        return substr(val, 2, length(val)-2)
+      }
+      if (match(s, /^(true|false)/)) {
+        return substr(s, RSTART, RLENGTH)
+      }
+      return ""
+    }
+    /"managed":[[:space:]]*\{/ { in_managed=1; next }
+    in_managed && /^[[:space:]]*\}[[:space:]]*\}[[:space:]]*$/ { in_managed=0; next }
+    in_managed {
+      body = find_entry_body($0, name)
+      if (body != "") {
+        v = extract_field(body, field)
+        if (v != "") print v
+      }
+    }
+  ' "$mf"
+}
+
+manifest_has() {
+  local mf="$1" name="$2"
+  [[ -f "$mf" ]] || return 1
+  manifest_list_names "$mf" | grep -Fxq "$name"
+}
+
+# Set/replace an entry. Writes out a one-line-per-entry format.
+# usage: manifest_set <mf> <name> <source> <copied_at> <git_bool>
+manifest_set() {
+  local mf="$1" name="$2" src="$3" copied_at="$4" git_bool="$5"
+  manifest_init_if_missing "$mf"
+  manifest_lock "$mf"
+
+  # Read all current entries except the one we're replacing
+  local tmp
+  tmp="$(mktemp "${mf}.XXXXXX")"
+  {
+    echo '{'
+    echo '  "managed": {'
+    local first=1
+    local existing
+    while IFS= read -r existing; do
+      [[ -z "$existing" ]] && continue
+      [[ "$existing" == "$name" ]] && continue
+      local e_src e_at e_git
+      e_src="$(manifest_get_field "$mf" "$existing" "source")"
+      e_at="$(manifest_get_field "$mf" "$existing" "copied_at")"
+      e_git="$(manifest_get_field "$mf" "$existing" "git")"
+      if [[ $first -eq 0 ]]; then echo ","; fi
+      first=0
+      printf '    "%s": {"source": "%s", "copied_at": "%s", "git": %s}' \
+        "$existing" "$(json_escape "$e_src")" "$e_at" "$e_git"
+    done < <(manifest_list_names "$mf")
+    if [[ $first -eq 0 ]]; then echo ","; fi
+    printf '    "%s": {"source": "%s", "copied_at": "%s", "git": %s}\n' \
+      "$name" "$(json_escape "$src")" "$copied_at" "$git_bool"
+    echo '  }'
+    echo '}'
+  } > "$tmp"
+  mv "$tmp" "$mf"
+}
+
+# Remove an entry.
+manifest_delete() {
+  local mf="$1" name="$2"
+  [[ -f "$mf" ]] || return 0
+  manifest_lock "$mf"
+  local tmp
+  tmp="$(mktemp "${mf}.XXXXXX")"
+  {
+    echo '{'
+    echo '  "managed": {'
+    local first=1
+    local existing
+    while IFS= read -r existing; do
+      [[ -z "$existing" ]] && continue
+      [[ "$existing" == "$name" ]] && continue
+      local e_src e_at e_git
+      e_src="$(manifest_get_field "$mf" "$existing" "source")"
+      e_at="$(manifest_get_field "$mf" "$existing" "copied_at")"
+      e_git="$(manifest_get_field "$mf" "$existing" "git")"
+      if [[ $first -eq 0 ]]; then echo ","; fi
+      first=0
+      printf '    "%s": {"source": "%s", "copied_at": "%s", "git": %s}' \
+        "$existing" "$(json_escape "$e_src")" "$e_at" "$e_git"
+    done < <(manifest_list_names "$mf")
+    [[ $first -eq 0 ]] && echo ""
+    echo '  }'
+    echo '}'
+  } > "$tmp"
+  mv "$tmp" "$mf"
+}
+
+# ---------- Commands ----------
+
+cmd_list() {
+  # Parse opts
+  local installed=0
+  local rest=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --installed) installed=1; shift ;;
+      *) rest+=("$1"); shift ;;
+    esac
+  done
+
+  if [[ $installed -eq 1 ]]; then
+    parse_opts "${rest[@]}"
+    for tdir in skills plugins; do
+      local dest mf
+      dest="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+      mf="$(manifest_path "$dest")"
+      echo "${C_BLU}[$tdir]${C_RST} $dest"
+      if [[ ! -f "$mf" ]]; then
+        echo "  ${C_DIM}(no manifest)${C_RST}"
+        continue
+      fi
+      local names_found=0
+      while IFS= read -r n; do
+        [[ -z "$n" ]] && continue
+        names_found=1
+        local src git_v
+        src="$(manifest_get_field "$mf" "$n" "source")"
+        git_v="$(manifest_get_field "$mf" "$n" "git")"
+        local exists="${C_GRN}exists${C_RST}"
+        [[ -d "$dest/$n" ]] || exists="${C_RED}missing${C_RST}"
+        printf "  %-30s [%s] git=%s src=%s\n" "$n" "$exists" "$git_v" "$src"
+      done < <(manifest_list_names "$mf")
+      if [[ $names_found -eq 0 ]]; then
+        echo "  ${C_DIM}(empty)${C_RST}"
+      fi
+    done
+    return 0
+  fi
+
+  # source listing
+  echo "${C_BLU}source:${C_RST} $CT_HOME"
+  for tdir in skills plugins; do
+    local sdir="$CT_HOME/$tdir"
+    echo "${C_BLU}[$tdir]${C_RST}"
+    if [[ ! -d "$sdir" ]]; then
+      echo "  ${C_DIM}(directory not found)${C_RST}"
+      continue
+    fi
+    local found=0
+    # iterate immediate subdirectories
+    local d
+    while IFS= read -r -d '' d; do
+      found=1
+      local name git_label
+      name="$(basename "$d")"
+      if is_git_managed "$d"; then
+        git_label="${C_GRN}git${C_RST}"
+      else
+        git_label="${C_DIM}local${C_RST}"
+      fi
+      printf "  %-30s [%s]\n" "$name" "$git_label"
+    done < <(find "$sdir" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    if [[ $found -eq 0 ]]; then
+      echo "  ${C_DIM}(empty)${C_RST}"
+    fi
+  done
+}
+
+cmd_add() {
+  parse_opts "$@"
+  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct add <type> <name> [--global|--project P] [-f]"
+  local tdir name src_path dest_dir dest_path mf
+  tdir="$(type_dir "${REST[0]}")"
+  name="${REST[1]}"
+  validate_name "$name"
+  src_path="$CT_HOME/$tdir/$name"
+  [[ -d "$src_path" ]] || die "source not found: $src_path"
+
+  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+  dest_path="$dest_dir/$name"
+  mf="$(manifest_path "$dest_dir")"
+
+  mkdir -p "$dest_dir"
+
+  if [[ -e "$dest_path" ]]; then
+    if [[ $FORCE -eq 1 ]]; then
+      rm -rf "$dest_path"
+    else
+      die "destination already exists: $dest_path (use -f to overwrite)"
+    fi
+  fi
+
+  # Copy excluding .git
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --exclude='.git' "$src_path/" "$dest_path/"
+  else
+    # Fallback: cp then remove .git
+    cp -a "$src_path" "$dest_path"
+    rm -rf "$dest_path/.git"
+  fi
+
+  local now git_bool
+  now="$(date -Iseconds)"
+  if is_git_managed "$src_path"; then git_bool="true"; else git_bool="false"; fi
+  manifest_set "$mf" "$name" "$src_path" "$now" "$git_bool"
+
+  ok "added $tdir/$name -> $dest_path"
+}
+
+cmd_remove() {
+  parse_opts "$@"
+  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct remove <type> <name> [--global|--project P] [-y]"
+  local tdir name dest_dir dest_path mf
+  tdir="$(type_dir "${REST[0]}")"
+  name="${REST[1]}"
+  validate_name "$name"
+  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+  dest_path="$dest_dir/$name"
+  mf="$(manifest_path "$dest_dir")"
+
+  if ! manifest_has "$mf" "$name"; then
+    die "not managed by ct (not in manifest): $tdir/$name at $dest_dir"
+  fi
+
+  if [[ $ASSUME_YES -ne 1 ]]; then
+    echo "About to remove: $dest_path"
+    read -r -p "Continue? [y/N] " ans
+    case "$ans" in
+      y|Y|yes|YES) ;;
+      *) info "aborted"; return 0 ;;
+    esac
+  fi
+
+  if [[ -e "$dest_path" ]]; then
+    rm -rf "$dest_path"
+  else
+    warn "directory was already missing: $dest_path"
+  fi
+  manifest_delete "$mf" "$name"
+  ok "removed $tdir/$name from $dest_dir"
+}
+
+cmd_update() {
+  # Either: ct update <type> <name>   or   ct update --all
+  if [[ $# -eq 1 && "$1" == "--all" ]]; then
+    local any=0
+    for tdir in skills plugins; do
+      local sdir="$CT_HOME/$tdir"
+      [[ -d "$sdir" ]] || continue
+      local d
+      while IFS= read -r -d '' d; do
+        if is_git_managed "$d"; then
+          any=1
+          info "updating $tdir/$(basename "$d")"
+          (cd "$d" && git pull --ff-only) || warn "git pull failed for $d"
+        fi
+      done < <(find "$sdir" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+    done
+    [[ $any -eq 1 ]] || info "no git-managed items found"
+    return 0
+  fi
+
+  [[ $# -eq 2 ]] || die "usage: ct update <type> <name>  |  ct update --all"
+  local tdir name src
+  tdir="$(type_dir "$1")"
+  name="$2"
+  src="$CT_HOME/$tdir/$name"
+  [[ -d "$src" ]] || die "source not found: $src"
+  is_git_managed "$src" || die "not git-managed: $src"
+  (cd "$src" && git pull --ff-only)
+  ok "updated $tdir/$name (run 'ct sync $1 $name [...]' to reflect to destinations)"
+}
+
+cmd_sync() {
+  parse_opts "$@"
+  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct sync <type> <name> [--global|--project P]"
+  local tdir name src_path dest_dir dest_path mf
+  tdir="$(type_dir "${REST[0]}")"
+  name="${REST[1]}"
+  validate_name "$name"
+  src_path="$CT_HOME/$tdir/$name"
+  [[ -d "$src_path" ]] || die "source not found: $src_path"
+
+  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+  dest_path="$dest_dir/$name"
+  mf="$(manifest_path "$dest_dir")"
+
+  manifest_has "$mf" "$name" || die "not installed at $dest_dir (run 'ct add' first)"
+
+  rm -rf "$dest_path"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --exclude='.git' "$src_path/" "$dest_path/"
+  else
+    cp -a "$src_path" "$dest_path"
+    rm -rf "$dest_path/.git"
+  fi
+
+  local now git_bool
+  now="$(date -Iseconds)"
+  if is_git_managed "$src_path"; then git_bool="true"; else git_bool="false"; fi
+  manifest_set "$mf" "$name" "$src_path" "$now" "$git_bool"
+
+  ok "synced $tdir/$name -> $dest_path"
+}
+
+cmd_register() {
+  # ct register <type> <git-url> [--name N]
+  local tdir url name=""
+  [[ $# -ge 2 ]] || die "usage: ct register <type> <git-url> [--name N]"
+  tdir="$(type_dir "$1")"; shift
+  url="$1"; shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) [[ $# -ge 2 ]] || die "--name requires a value"
+              name="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    name="$(basename "$url" .git)"
+  fi
+  validate_name "$name"
+
+  local target="$CT_HOME/$tdir/$name"
+  [[ -e "$target" ]] && die "already exists: $target"
+  mkdir -p "$CT_HOME/$tdir"
+  git clone -- "$url" "$target"
+  ok "registered $tdir/$name at $target"
+}
+
+# ---------- Main ----------
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage; exit 0
+  fi
+
+  local sub="$1"; shift
+  case "$sub" in
+    list)     cmd_list "$@" ;;
+    add)      cmd_add "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    update)   cmd_update "$@" ;;
+    sync)     cmd_sync "$@" ;;
+    register) cmd_register "$@" ;;
+    version|--version|-V) echo "ct $CT_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) err "unknown subcommand: $sub"; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
