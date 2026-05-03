@@ -150,3 +150,94 @@ teardown() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"source not found"* ]]
 }
+
+# ---------- skills/{name}/ サブディレクトリ自動検出 ----------
+
+@test "サブディレクトリ自動検出: skills/<name>/ があれば直下にコピーされる" {
+  # ソースリポジトリが skills/my-skill/ にスキルを持つ構造を作成
+  mkdir -p "$CT_HOME/skills/my-skill/skills/my-skill/references"
+  echo "# skill" > "$CT_HOME/skills/my-skill/skills/my-skill/SKILL.md"
+  echo "ref"     > "$CT_HOME/skills/my-skill/skills/my-skill/references/ref.md"
+  # 他のファイルはルートにある（コピーされないはず）
+  echo "readme"  > "$CT_HOME/skills/my-skill/README.md"
+
+  run bash "$CT" add skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/SKILL.md" ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/references/ref.md" ]
+  [ ! -f "$PROJECT_DIR/.claude/skills/my-skill/README.md" ]
+  [ ! -d "$PROJECT_DIR/.claude/skills/my-skill/skills" ]
+}
+
+@test "サブディレクトリ自動検出: .ct-include があれば自動検出より優先される" {
+  mkdir -p "$CT_HOME/skills/my-skill/skills/my-skill"
+  echo "# skill" > "$CT_HOME/skills/my-skill/skills/my-skill/SKILL.md"
+  # .ct-include で README.md だけを指定（自動検出より優先）
+  printf 'README.md\n' > "$CT_HOME/skills/my-skill/.ct-include"
+
+  run bash "$CT" add skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/README.md" ]
+  [ ! -f "$PROJECT_DIR/.claude/skills/my-skill/SKILL.md" ]
+}
+
+@test "sync: サブディレクトリ自動検出が適用される" {
+  mkdir -p "$CT_HOME/skills/my-skill/skills/my-skill"
+  echo "# skill" > "$CT_HOME/skills/my-skill/skills/my-skill/SKILL.md"
+
+  run bash "$CT" add skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/SKILL.md" ]
+
+  echo "# updated" > "$CT_HOME/skills/my-skill/skills/my-skill/SKILL.md"
+  run bash "$CT" sync skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  grep -q "updated" "$PROJECT_DIR/.claude/skills/my-skill/SKILL.md"
+}
+
+@test "サブディレクトリ自動検出: plugin 型でも plugins/<name>/ が検出される" {
+  mkdir -p "$CT_HOME/plugins/my-plugin/plugins/my-plugin/lib"
+  echo "# plugin" > "$CT_HOME/plugins/my-plugin/plugins/my-plugin/plugin.md"
+  echo "lib"      > "$CT_HOME/plugins/my-plugin/plugins/my-plugin/lib/util.sh"
+  echo "readme"   > "$CT_HOME/plugins/my-plugin/README.md"
+
+  run bash "$CT" add plugin my-plugin --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [ -f "$PROJECT_DIR/.claude/plugins/my-plugin/plugin.md" ]
+  [ -f "$PROJECT_DIR/.claude/plugins/my-plugin/lib/util.sh" ]
+  [ ! -f "$PROJECT_DIR/.claude/plugins/my-plugin/README.md" ]
+}
+
+# ---------- 空 .ct-include の落とし穴 ----------
+
+@test "空の .ct-include は無視され、自動検出が走る" {
+  # 空の .ct-include（フィルタ無効化のつもりで作る人がいる想定）
+  : > "$CT_HOME/skills/my-skill/.ct-include"
+  mkdir -p "$CT_HOME/skills/my-skill/skills/my-skill"
+  echo "# skill" > "$CT_HOME/skills/my-skill/skills/my-skill/SKILL.md"
+
+  run bash "$CT" add skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/SKILL.md" ]
+}
+
+@test "コメント・空行のみの .ct-include は無視される" {
+  printf '# only comment\n\n   \n' > "$CT_HOME/skills/my-skill/.ct-include"
+
+  run bash "$CT" add skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  # フィルタ無効扱い → ルートの全ファイルがコピーされる
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/SKILL.md" ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/README.md" ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/tests/test.sh" ]
+}
+
+@test ".ct-include なしで全コピー時、.ct-include 自体はコピー先に含まれない" {
+  # ルート直下に .ct-include がある（パターンあり）と通常のフィルタが走るので、
+  # サブディレクトリ自動検出のケースで .ct-include が無いことを確認
+  : > "$CT_HOME/skills/my-skill/.ct-include"  # 空 → 自動検出走る
+
+  run bash "$CT" add skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [ ! -f "$PROJECT_DIR/.claude/skills/my-skill/.ct-include" ]
+}

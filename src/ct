@@ -141,12 +141,25 @@ is_git_managed() {
 # Copy src_path/ to dest_path/, respecting .ct-include if present.
 # .ct-include: one pattern per line; blank lines and # comments are ignored.
 # If absent, copies everything except .git (preserves current behaviour).
+# .ct-include に有効なパターン（コメント・空行以外）が 1 行でもあるか
+include_has_patterns() {
+  local f="$1"
+  [[ -f "$f" ]] || return 1
+  grep -Eq -v '^[[:space:]]*(#|$)' "$f"
+}
+
 copy_skill_files() {
-  local src_path="$1" dest_path="$2"
+  local src_path="$1" dest_path="$2" tdir="${3:-}" name="${4:-}"
   local include_file="$src_path/.ct-include"
 
+  # 有効なパターンを持つ .ct-include がなく、src_path/{tdir}/{name}/ が存在すればそこをコピー元にする
+  local effective_src="$src_path"
+  if ! include_has_patterns "$include_file" && [[ -n "$tdir" && -n "$name" && -d "$src_path/$tdir/$name" ]]; then
+    effective_src="$src_path/$tdir/$name"
+  fi
+
   if command -v rsync >/dev/null 2>&1; then
-    if [[ -f "$include_file" ]]; then
+    if include_has_patterns "$include_file"; then
       local rsync_args=(-a --exclude='.git' --exclude='.ct-include')
       while IFS= read -r pattern || [[ -n "$pattern" ]]; do
         [[ -z "$pattern" || "$pattern" == '#'* ]] && continue
@@ -157,10 +170,10 @@ copy_skill_files() {
       rsync_args+=(--exclude='*')
       rsync "${rsync_args[@]}" "$src_path/" "$dest_path/"
     else
-      rsync -a --exclude='.git' "$src_path/" "$dest_path/"
+      rsync -a --exclude='.git' --exclude='.ct-include' "$effective_src/" "$dest_path/"
     fi
   else
-    if [[ -f "$include_file" ]]; then
+    if include_has_patterns "$include_file"; then
       mkdir -p "$dest_path"
       while IFS= read -r pattern || [[ -n "$pattern" ]]; do
         [[ -z "$pattern" || "$pattern" == '#'* ]] && continue
@@ -168,8 +181,8 @@ copy_skill_files() {
         [[ -e "$src_item" ]] && cp -a "$src_item" "$dest_path/"
       done < "$include_file"
     else
-      cp -a "$src_path" "$dest_path"
-      rm -rf "$dest_path/.git"
+      cp -a "$effective_src" "$dest_path"
+      rm -rf "$dest_path/.git" "$dest_path/.ct-include"
     fi
   fi
 }
@@ -443,7 +456,7 @@ cmd_add() {
     fi
   fi
 
-  copy_skill_files "$src_path" "$dest_path"
+  copy_skill_files "$src_path" "$dest_path" "$tdir" "$name"
 
   local now git_bool
   now="$(date -Iseconds)"
@@ -534,7 +547,7 @@ cmd_sync() {
   manifest_has "$mf" "$name" || die "not installed at $dest_dir (run 'ct add' first)"
 
   rm -rf "$dest_path"
-  copy_skill_files "$src_path" "$dest_path"
+  copy_skill_files "$src_path" "$dest_path" "$tdir" "$name"
 
   local now git_bool
   now="$(date -Iseconds)"
