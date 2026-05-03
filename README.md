@@ -30,3 +30,15 @@ ct remove skill some-skill -y    # 確認スキップ
 ct list                                  # 集約元
 ct list --installed                      # カレントプロジェクトの管理対象
 ct list --installed --global             # グローバルの管理対象
+
+### コピー対象のフィルタ管理（.ct-include）
+
+git 管理のスキルリポジトリには `SKILL.md` 以外のファイル（README, CI 設定等）が含まれることがある。
+`.ct-include` に列挙したファイル・ディレクトリだけをコピーするよう制限できる。
+
+ct include skill some-skill add SKILL.md       # SKILL.md を対象に追加
+ct include skill some-skill add 'references/'  # ディレクトリを対象に追加
+ct include skill some-skill remove README.md   # 除外するパターンを削除
+ct include skill some-skill                    # 現在のフィルタ一覧
+
+`.ct-include` がなければ従来通り全ファイルをコピーする。

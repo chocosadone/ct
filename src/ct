@@ -38,6 +38,9 @@ USAGE:
   ct update <type> <name>                      git pull on the source item
   ct update --all                              git pull on all git-managed source items
   ct sync <type> <name> [opts]                 Re-copy (after update) to destination
+  ct include <type> <name>                     List .ct-include filter patterns
+  ct include <type> <name> add <pattern>       Add a pattern to .ct-include
+  ct include <type> <name> remove <pattern>    Remove a pattern from .ct-include
   ct register <type> <git-url> [--name N]      git clone into source
   ct version                                   Show version
   ct help                                      Show this help
@@ -133,6 +136,42 @@ parse_opts() {
 is_git_managed() {
   local path="$1"
   [[ -d "$path/.git" ]]
+}
+
+# Copy src_path/ to dest_path/, respecting .ct-include if present.
+# .ct-include: one pattern per line; blank lines and # comments are ignored.
+# If absent, copies everything except .git (preserves current behaviour).
+copy_skill_files() {
+  local src_path="$1" dest_path="$2"
+  local include_file="$src_path/.ct-include"
+
+  if command -v rsync >/dev/null 2>&1; then
+    if [[ -f "$include_file" ]]; then
+      local rsync_args=(-a --exclude='.git' --exclude='.ct-include')
+      while IFS= read -r pattern || [[ -n "$pattern" ]]; do
+        [[ -z "$pattern" || "$pattern" == '#'* ]] && continue
+        rsync_args+=(--include="$pattern")
+        # rsync requires explicit include of directory contents
+        [[ "$pattern" == */ ]] && rsync_args+=(--include="${pattern}**")
+      done < "$include_file"
+      rsync_args+=(--exclude='*')
+      rsync "${rsync_args[@]}" "$src_path/" "$dest_path/"
+    else
+      rsync -a --exclude='.git' "$src_path/" "$dest_path/"
+    fi
+  else
+    if [[ -f "$include_file" ]]; then
+      mkdir -p "$dest_path"
+      while IFS= read -r pattern || [[ -n "$pattern" ]]; do
+        [[ -z "$pattern" || "$pattern" == '#'* ]] && continue
+        local src_item="$src_path/${pattern%/}"
+        [[ -e "$src_item" ]] && cp -a "$src_item" "$dest_path/"
+      done < "$include_file"
+    else
+      cp -a "$src_path" "$dest_path"
+      rm -rf "$dest_path/.git"
+    fi
+  fi
 }
 
 # ---------- Manifest (pure bash, simple key-value JSON) ----------
@@ -404,14 +443,7 @@ cmd_add() {
     fi
   fi
 
-  # Copy excluding .git
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --exclude='.git' "$src_path/" "$dest_path/"
-  else
-    # Fallback: cp then remove .git
-    cp -a "$src_path" "$dest_path"
-    rm -rf "$dest_path/.git"
-  fi
+  copy_skill_files "$src_path" "$dest_path"
 
   local now git_bool
   now="$(date -Iseconds)"
@@ -502,12 +534,7 @@ cmd_sync() {
   manifest_has "$mf" "$name" || die "not installed at $dest_dir (run 'ct add' first)"
 
   rm -rf "$dest_path"
-  if command -v rsync >/dev/null 2>&1; then
-    rsync -a --exclude='.git' "$src_path/" "$dest_path/"
-  else
-    cp -a "$src_path" "$dest_path"
-    rm -rf "$dest_path/.git"
-  fi
+  copy_skill_files "$src_path" "$dest_path"
 
   local now git_bool
   now="$(date -Iseconds)"
@@ -515,6 +542,51 @@ cmd_sync() {
   manifest_set "$mf" "$name" "$src_path" "$now" "$git_bool"
 
   ok "synced $tdir/$name -> $dest_path"
+}
+
+cmd_include() {
+  [[ $# -ge 2 ]] || die "usage: ct include <type> <name> [add|remove <pattern>]"
+  local tdir name
+  tdir="$(type_dir "$1")"; shift
+  name="$1"; shift
+  validate_name "$name"
+
+  local src_dir="$CT_HOME/$tdir/$name"
+  [[ -d "$src_dir" ]] || die "source not found: $src_dir"
+
+  local include_file="$src_dir/.ct-include"
+  local action="${1:-list}"
+
+  case "$action" in
+    list)
+      if [[ -f "$include_file" ]]; then
+        cat "$include_file"
+      else
+        info "no .ct-include (all files will be copied)"
+      fi
+      ;;
+    add)
+      [[ $# -ge 2 ]] || die "usage: ct include <type> <name> add <pattern>"
+      local pattern="$2"
+      if [[ -f "$include_file" ]] && grep -qxF "$pattern" "$include_file" 2>/dev/null; then
+        info "already in .ct-include: $pattern"; return 0
+      fi
+      echo "$pattern" >> "$include_file"
+      ok "added to .ct-include: $pattern"
+      ;;
+    remove)
+      [[ $# -ge 2 ]] || die "usage: ct include <type> <name> remove <pattern>"
+      local pattern="$2"
+      [[ -f "$include_file" ]] || die ".ct-include not found: $include_file"
+      local tmp; tmp="$(mktemp)"
+      grep -vxF "$pattern" "$include_file" > "$tmp" || true
+      mv "$tmp" "$include_file"
+      ok "removed from .ct-include: $pattern"
+      ;;
+    *)
+      die "unknown action: $action (use add, remove, or omit for list)"
+      ;;
+  esac
 }
 
 cmd_register() {
@@ -556,6 +628,7 @@ main() {
     remove|rm) cmd_remove "$@" ;;
     update)   cmd_update "$@" ;;
     sync)     cmd_sync "$@" ;;
+    include)  cmd_include "$@" ;;
     register) cmd_register "$@" ;;
     version|--version|-V) echo "ct $CT_VERSION" ;;
     help|-h|--help) usage ;;
