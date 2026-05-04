@@ -23,6 +23,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 |------|-----------|------|
 | `CT_HOME` | `~/.claude-tools` | スキル・プラグインの集約元 |
 | `GLOBAL_CLAUDE_DIR` | `~/.claude` | グローバルターゲットのベースパス |
+| `CODEX_HOME` | `~/.codex` | Codex global plugin のベースパス |
+| `GLOBAL_AGENTS_DIR` | `~/.agents` | Codex global skill / marketplace のベースパス |
 
 ## アーキテクチャ
 
@@ -36,7 +38,25 @@ CT_HOME/
   skills/<name>/    ← コピー先（.git, .ct-include は除外）
   plugins/<name>/
   .ct-manifest.json ← 管理台帳
+
+.agents/
+  skills/<name>/              ← Codex project/global skill コピー先
+  plugins/marketplace.json    ← Codex plugin marketplace（ct-local）
+
+plugins/<name>/               ← Codex project plugin コピー先
+~/.codex/plugins/<name>/      ← Codex global plugin コピー先
 ```
+
+## Codex ターゲット
+
+`--target codex` を指定すると、Claude 用の `.claude/` ではなく Codex の公式配置にコピーする。未指定時は `--target claude` と同じで、既存挙動を維持する。
+
+- skill project: `<project>/.agents/skills/<name>`
+- skill global: `~/.agents/skills/<name>`
+- plugin project: `<project>/plugins/<name>` と `<project>/.agents/plugins/marketplace.json`
+- plugin global: `~/.codex/plugins/<name>` と `~/.agents/plugins/marketplace.json`
+
+Codex plugin はコピー元の実効ルートに `.codex-plugin/plugin.json` が必要。`ct` が管理する marketplace は `name: "ct-local"` のみ更新し、既存の別 marketplace は上書きしない。
 
 ### コピー元の解決ルール
 
@@ -149,6 +169,9 @@ bats tests/security.bats
 
 # .ct-include フィルタリングおよび ct include コマンドのテスト
 bats tests/ct-include.bats
+
+# Codex target 対応のテスト
+bats tests/codex-target.bats
 ```
 
 変更後は上記自動テストに加えて、実際の add/remove/sync を手動で確認する。

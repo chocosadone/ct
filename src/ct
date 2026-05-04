@@ -7,6 +7,8 @@ set -euo pipefail
 # ---------- Config ----------
 CT_HOME="${CT_HOME:-$HOME/.claude-tools}"
 GLOBAL_CLAUDE_DIR="${GLOBAL_CLAUDE_DIR:-$HOME/.claude}"
+GLOBAL_CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+GLOBAL_AGENTS_DIR="${GLOBAL_AGENTS_DIR:-$HOME/.agents}"
 MANIFEST_NAME=".ct-manifest.json"
 CT_VERSION="0.1.0"
 
@@ -52,12 +54,15 @@ ARGS:
 OPTIONS:
   --global             Target ~/.claude/
   --project <path>     Target <path>/.claude/ (default: current directory)
+  --target <name>      Destination format: claude | codex (default: claude)
   -f                   Overwrite on add
   -y                   Skip confirmation on remove
 
 ENV:
   CT_HOME              Source directory (default: ~/.claude-tools)
   GLOBAL_CLAUDE_DIR    Global target (default: ~/.claude)
+  CODEX_HOME           Codex home for global plugins (default: ~/.codex)
+  GLOBAL_AGENTS_DIR    Global agents target for Codex skills/marketplace (default: ~/.agents)
 EOF
 }
 
@@ -91,22 +96,69 @@ type_dir() {
   esac
 }
 
-# resolve destination root: prints absolute path of the .claude/<type-dir> directory
-# usage: resolve_dest <type-dir> <scope-flag> [<project-path>]
+# resolve project path to an absolute path
+resolve_project_root() {
+  local ppath="${1:-.}"
+  if [[ "$ppath" != /* ]]; then
+    ppath="$(cd "$ppath" 2>/dev/null && pwd)" || die "project path not found: $ppath"
+  fi
+  echo "$ppath"
+}
+
+# resolve destination root: prints absolute path of the directory that stores copied items
+# usage: resolve_dest <type-dir> <scope-flag> [<project-path>] [<target>]
 # scope-flag: "global" or "project"
 resolve_dest() {
-  local tdir="$1" scope="$2" ppath="${3:-.}"
+  local tdir="$1" scope="$2" ppath="${3:-.}" target="${4:-claude}"
   local base
+  case "$target" in
+    claude)
+      if [[ "$scope" == "global" ]]; then
+        base="$GLOBAL_CLAUDE_DIR"
+      else
+        ppath="$(resolve_project_root "$ppath")"
+        base="$ppath/.claude"
+      fi
+      echo "$base/$tdir"
+      ;;
+    codex)
+      if [[ "$tdir" == "skills" ]]; then
+        if [[ "$scope" == "global" ]]; then
+          echo "$GLOBAL_AGENTS_DIR/skills"
+        else
+          ppath="$(resolve_project_root "$ppath")"
+          echo "$ppath/.agents/skills"
+        fi
+      else
+        if [[ "$scope" == "global" ]]; then
+          echo "$GLOBAL_CODEX_DIR/plugins"
+        else
+          ppath="$(resolve_project_root "$ppath")"
+          echo "$ppath/plugins"
+        fi
+      fi
+      ;;
+    *) die "invalid target: $target (must be claude or codex)" ;;
+  esac
+}
+
+resolve_marketplace_file() {
+  local scope="$1" ppath="${2:-.}"
   if [[ "$scope" == "global" ]]; then
-    base="$GLOBAL_CLAUDE_DIR"
+    echo "$GLOBAL_AGENTS_DIR/plugins/marketplace.json"
   else
-    # absolutize
-    if [[ "$ppath" != /* ]]; then
-      ppath="$(cd "$ppath" 2>/dev/null && pwd)" || die "project path not found: $ppath"
-    fi
-    base="$ppath/.claude"
+    ppath="$(resolve_project_root "$ppath")"
+    echo "$ppath/.agents/plugins/marketplace.json"
   fi
-  echo "$base/$tdir"
+}
+
+marketplace_plugin_path() {
+  local scope="$1" name="$2"
+  if [[ "$scope" == "global" ]]; then
+    echo "./.codex/plugins/$name"
+  else
+    echo "./plugins/$name"
+  fi
 }
 
 # parse common scope options from "$@", sets: SCOPE, PROJECT_PATH, FORCE, ASSUME_YES
@@ -114,6 +166,7 @@ resolve_dest() {
 parse_opts() {
   SCOPE="project"
   PROJECT_PATH="."
+  TARGET="claude"
   FORCE=0
   ASSUME_YES=0
   REST=()
@@ -123,6 +176,11 @@ parse_opts() {
       --project)
         [[ $# -ge 2 ]] || die "--project requires a path"
         SCOPE="project"; PROJECT_PATH="$2"; shift 2 ;;
+      --target)
+        [[ $# -ge 2 ]] || die "--target requires a value"
+        TARGET="$2"
+        case "$TARGET" in claude|codex) ;; *) die "invalid target: $TARGET (must be claude or codex)" ;; esac
+        shift 2 ;;
       -f|--force) FORCE=1; shift ;;
       -y|--yes)   ASSUME_YES=1; shift ;;
       --) shift; while [[ $# -gt 0 ]]; do REST+=("$1"); shift; done ;;
@@ -148,15 +206,30 @@ include_has_patterns() {
   grep -Eq -v '^[[:space:]]*(#|$)' "$f"
 }
 
+effective_source_path() {
+  local src_path="$1" tdir="${2:-}" name="${3:-}"
+  local include_file="$src_path/.ct-include"
+  if ! include_has_patterns "$include_file" && [[ -n "$tdir" && -n "$name" && -d "$src_path/$tdir/$name" ]]; then
+    echo "$src_path/$tdir/$name"
+  else
+    echo "$src_path"
+  fi
+}
+
+validate_codex_plugin_source() {
+  local src_path="$1" tdir="$2" name="$3"
+  local effective_src
+  effective_src="$(effective_source_path "$src_path" "$tdir" "$name")"
+  [[ -f "$effective_src/.codex-plugin/plugin.json" ]] || die "codex plugin manifest not found: $effective_src/.codex-plugin/plugin.json"
+}
+
 copy_skill_files() {
   local src_path="$1" dest_path="$2" tdir="${3:-}" name="${4:-}"
   local include_file="$src_path/.ct-include"
 
   # 有効なパターンを持つ .ct-include がなく、src_path/{tdir}/{name}/ が存在すればそこをコピー元にする
   local effective_src="$src_path"
-  if ! include_has_patterns "$include_file" && [[ -n "$tdir" && -n "$name" && -d "$src_path/$tdir/$name" ]]; then
-    effective_src="$src_path/$tdir/$name"
-  fi
+  effective_src="$(effective_source_path "$src_path" "$tdir" "$name")"
 
   if command -v rsync >/dev/null 2>&1; then
     if include_has_patterns "$include_file"; then
@@ -361,6 +434,61 @@ manifest_delete() {
   mv "$tmp" "$mf"
 }
 
+marketplace_is_ct_managed() {
+  local marketplace="$1"
+  [[ -f "$marketplace" ]] || return 0
+  local first_name
+  first_name="$(awk '
+    match($0, /"name"[[:space:]]*:[[:space:]]*"[^"]+"/) {
+      s = substr($0, RSTART, RLENGTH)
+      sub(/^.*"name"[[:space:]]*:[[:space:]]*"/, "", s)
+      sub(/".*$/, "", s)
+      print s
+      exit
+    }
+  ' "$marketplace")"
+  [[ "$first_name" == "ct-local" ]]
+}
+
+marketplace_write_codex_plugins() {
+  local mf="$1" marketplace="$2" scope="$3"
+  marketplace_is_ct_managed "$marketplace" || die "marketplace already exists and is not managed by ct: $marketplace"
+
+  mkdir -p "$(dirname "$marketplace")"
+  local tmp first=1
+  tmp="$(mktemp "${marketplace}.XXXXXX")"
+  {
+    echo '{'
+    echo '  "name": "ct-local",'
+    echo '  "interface": {'
+    echo '    "displayName": "ct Local Plugins"'
+    echo '  },'
+    echo '  "plugins": ['
+    local n
+    while IFS= read -r n; do
+      [[ -z "$n" ]] && continue
+      if [[ $first -eq 0 ]]; then echo ","; fi
+      first=0
+      printf '    {\n'
+      printf '      "name": "%s",\n' "$n"
+      printf '      "source": {\n'
+      printf '        "source": "local",\n'
+      printf '        "path": "%s"\n' "$(marketplace_plugin_path "$scope" "$n")"
+      printf '      },\n'
+      printf '      "policy": {\n'
+      printf '        "installation": "AVAILABLE",\n'
+      printf '        "authentication": "ON_INSTALL"\n'
+      printf '      },\n'
+      printf '      "category": "Productivity"\n'
+      printf '    }'
+    done < <(manifest_list_names "$mf")
+    [[ $first -eq 0 ]] && echo ""
+    echo '  ]'
+    echo '}'
+  } > "$tmp"
+  mv "$tmp" "$marketplace"
+}
+
 # ---------- Commands ----------
 
 cmd_list() {
@@ -378,7 +506,7 @@ cmd_list() {
     parse_opts "${rest[@]}"
     for tdir in skills plugins; do
       local dest mf
-      dest="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+      dest="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH" "$TARGET")"
       mf="$(manifest_path "$dest")"
       echo "${C_BLU}[$tdir]${C_RST} $dest"
       if [[ ! -f "$mf" ]]; then
@@ -434,7 +562,7 @@ cmd_list() {
 
 cmd_add() {
   parse_opts "$@"
-  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct add <type> <name> [--global|--project P] [-f]"
+  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct add <type> <name> [--global|--project P] [--target claude|codex] [-f]"
   local tdir name src_path dest_dir dest_path mf
   tdir="$(type_dir "${REST[0]}")"
   name="${REST[1]}"
@@ -442,9 +570,16 @@ cmd_add() {
   src_path="$CT_HOME/$tdir/$name"
   [[ -d "$src_path" ]] || die "source not found: $src_path"
 
-  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    validate_codex_plugin_source "$src_path" "$tdir" "$name"
+  fi
+
+  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH" "$TARGET")"
   dest_path="$dest_dir/$name"
   mf="$(manifest_path "$dest_dir")"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    marketplace_is_ct_managed "$(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")" || die "marketplace already exists and is not managed by ct: $(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")"
+  fi
 
   mkdir -p "$dest_dir"
 
@@ -462,20 +597,26 @@ cmd_add() {
   now="$(date -Iseconds)"
   if is_git_managed "$src_path"; then git_bool="true"; else git_bool="false"; fi
   manifest_set "$mf" "$name" "$src_path" "$now" "$git_bool"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    marketplace_write_codex_plugins "$mf" "$(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")" "$SCOPE"
+  fi
 
   ok "added $tdir/$name -> $dest_path"
 }
 
 cmd_remove() {
   parse_opts "$@"
-  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct remove <type> <name> [--global|--project P] [-y]"
+  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct remove <type> <name> [--global|--project P] [--target claude|codex] [-y]"
   local tdir name dest_dir dest_path mf
   tdir="$(type_dir "${REST[0]}")"
   name="${REST[1]}"
   validate_name "$name"
-  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH" "$TARGET")"
   dest_path="$dest_dir/$name"
   mf="$(manifest_path "$dest_dir")"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    marketplace_is_ct_managed "$(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")" || die "marketplace already exists and is not managed by ct: $(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")"
+  fi
 
   if ! manifest_has "$mf" "$name"; then
     die "not managed by ct (not in manifest): $tdir/$name at $dest_dir"
@@ -496,6 +637,9 @@ cmd_remove() {
     warn "directory was already missing: $dest_path"
   fi
   manifest_delete "$mf" "$name"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    marketplace_write_codex_plugins "$mf" "$(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")" "$SCOPE"
+  fi
   ok "removed $tdir/$name from $dest_dir"
 }
 
@@ -532,7 +676,7 @@ cmd_update() {
 
 cmd_sync() {
   parse_opts "$@"
-  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct sync <type> <name> [--global|--project P]"
+  [[ ${#REST[@]} -eq 2 ]] || die "usage: ct sync <type> <name> [--global|--project P] [--target claude|codex]"
   local tdir name src_path dest_dir dest_path mf
   tdir="$(type_dir "${REST[0]}")"
   name="${REST[1]}"
@@ -540,9 +684,16 @@ cmd_sync() {
   src_path="$CT_HOME/$tdir/$name"
   [[ -d "$src_path" ]] || die "source not found: $src_path"
 
-  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH")"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    validate_codex_plugin_source "$src_path" "$tdir" "$name"
+  fi
+
+  dest_dir="$(resolve_dest "$tdir" "$SCOPE" "$PROJECT_PATH" "$TARGET")"
   dest_path="$dest_dir/$name"
   mf="$(manifest_path "$dest_dir")"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    marketplace_is_ct_managed "$(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")" || die "marketplace already exists and is not managed by ct: $(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")"
+  fi
 
   manifest_has "$mf" "$name" || die "not installed at $dest_dir (run 'ct add' first)"
 
@@ -553,6 +704,9 @@ cmd_sync() {
   now="$(date -Iseconds)"
   if is_git_managed "$src_path"; then git_bool="true"; else git_bool="false"; fi
   manifest_set "$mf" "$name" "$src_path" "$now" "$git_bool"
+  if [[ "$TARGET" == "codex" && "$tdir" == "plugins" ]]; then
+    marketplace_write_codex_plugins "$mf" "$(resolve_marketplace_file "$SCOPE" "$PROJECT_PATH")" "$SCOPE"
+  fi
 
   ok "synced $tdir/$name -> $dest_path"
 }

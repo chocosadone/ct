@@ -17,4 +17,7 @@ jobs:
           sudo /tmp/bats/install.sh /usr/local
 
       - name: Run bats
-        run: bats tests/security.bats
+        run: |
+          bats tests/security.bats
+          bats tests/ct-include.bats
+          bats tests/codex-target.bats

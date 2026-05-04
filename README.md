@@ -51,3 +51,31 @@ ct include skill some-skill                    # 現在のフィルタ一覧
 1. `.ct-include`（有効パターンあり）
 2. `skills/<name>/` または `plugins/<name>/` サブディレクトリ
 3. リポジトリルート全体
+
+## Codex 対応
+
+既定のターゲットは従来どおり Claude Code です。Codex 用に配置する場合は `--target codex` を付ける。
+
+```bash
+# プロジェクトスコープ: .agents/skills/<name>
+ct add skill some-skill --target codex
+
+# グローバルスコープ: ~/.agents/skills/<name>
+ct add skill some-skill --target codex --global
+
+# プロジェクトスコープ: plugins/<name> と .agents/plugins/marketplace.json
+ct add plugin some-plugin --target codex
+
+# グローバルスコープ: ~/.codex/plugins/<name> と ~/.agents/plugins/marketplace.json
+ct add plugin some-plugin --target codex --global
+```
+
+Codex plugin は `.codex-plugin/plugin.json` が必要。`ct` が生成・更新する marketplace は `ct-local` という名前で管理される。既存の marketplace が `ct-local` でない場合、上書きを避けるためエラーになる。
+
+インストール済み一覧も target を指定できる。
+
+```bash
+ct list --installed --target codex
+ct sync plugin some-plugin --target codex
+ct remove plugin some-plugin --target codex -y
+```
