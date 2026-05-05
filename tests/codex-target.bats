@@ -39,6 +39,19 @@ teardown() {
   [ -f "$PROJECT_DIR/.agents/skills/.ct-manifest.json" ]
 }
 
+@test "既定 target は claude のまま維持される" {
+  run bash "$CT" add skill my-skill --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [ -f "$PROJECT_DIR/.claude/skills/my-skill/SKILL.md" ]
+  [ ! -e "$PROJECT_DIR/.agents/skills/my-skill/SKILL.md" ]
+}
+
+@test "不正な target はエラーになる" {
+  run bash "$CT" add skill my-skill --target unknown --project "$PROJECT_DIR"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid target: unknown"* ]]
+}
+
 @test "codex skill: global は GLOBAL_AGENTS_DIR/skills にコピーされる" {
   run bash "$CT" add skill my-skill --target codex --global
   [ "$status" -eq 0 ]
@@ -64,6 +77,20 @@ teardown() {
   [ -f "$PROJECT_DIR/.agents/plugins/marketplace.json" ]
   grep -q '"name": "ct-local"' "$PROJECT_DIR/.agents/plugins/marketplace.json"
   grep -q '"path": "./plugins/my-plugin"' "$PROJECT_DIR/.agents/plugins/marketplace.json"
+}
+
+@test "codex list --installed は codex 側の manifest を読む" {
+  run bash "$CT" add skill my-skill --target codex --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  run bash "$CT" add plugin my-plugin --target codex --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+
+  run bash "$CT" list --installed --target codex --project "$PROJECT_DIR"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *".agents/skills"* ]]
+  [[ "$output" == *"plugins"* ]]
+  [[ "$output" == *"my-skill"* ]]
+  [[ "$output" == *"my-plugin"* ]]
 }
 
 @test "codex plugin: global は CODEX_HOME/plugins と GLOBAL_AGENTS_DIR marketplace に追加される" {

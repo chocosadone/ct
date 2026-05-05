@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# ct - Claude Tools manager
-# Manage skills/plugins by copying from a central source to project or global .claude/
+# ct - Claude / Codex tools manager
+# Manage skills/plugins by copying from a central source to Claude or Codex destinations.
 
 set -euo pipefail
 
@@ -30,7 +30,7 @@ die()  { err "$*"; exit 1; }
 # ---------- Usage ----------
 usage() {
   cat <<'EOF'
-ct - Claude Tools manager
+ct - Claude / Codex tools manager
 
 USAGE:
   ct list                                      List items in source (~/.claude-tools)
@@ -52,8 +52,8 @@ ARGS:
   <name>   directory name under ~/.claude-tools/<type>s/
 
 OPTIONS:
-  --global             Target ~/.claude/
-  --project <path>     Target <path>/.claude/ (default: current directory)
+  --global             Target global destination for selected format
+  --project <path>     Target project destination for selected format (default: current directory)
   --target <name>      Destination format: claude | codex (default: claude)
   -f                   Overwrite on add
   -y                   Skip confirmation on remove

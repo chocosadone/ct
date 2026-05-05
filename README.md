@@ -1,17 +1,17 @@
 # ct
 
-`ct` は Claude Tools マネージャー。
-`~/.claude-tools/` を集約元として、スキル・プラグインをプロジェクトまたはグローバルの `.claude/` ディレクトリにコピー管理する Bash スクリプト。
+`ct` は Claude / Codex tools マネージャー。
+`~/.claude-tools/` を集約元として、スキル・プラグインを Claude Code または Codex のプロジェクト / グローバル配置先へコピー管理する Bash スクリプト。
 
 ## 使い方
 
 ### Git 管理の skill を集約元に追加
 ct register skill https://github.com/user/some-skill.git
 
-### プロジェクトに追加（カレントディレクトリの .claude/）
+### プロジェクトに追加（既定: カレントディレクトリの `.claude/`）
 ct add skill some-skill
 
-### グローバルに追加
+### グローバルに追加（既定: `~/.claude/`）
 ct add skill some-skill --global
 
 ### 集約元の更新（git pull のみ、コピー先には反映されない）
@@ -54,7 +54,7 @@ ct include skill some-skill                    # 現在のフィルタ一覧
 
 ## Codex 対応
 
-既定のターゲットは従来どおり Claude Code です。Codex 用に配置する場合は `--target codex` を付ける。
+既定のターゲットは従来どおり Claude Code（`--target claude`）です。Codex 用に配置する場合は `--target codex` を付ける。
 
 ```bash
 # プロジェクトスコープ: .agents/skills/<name>
@@ -72,7 +72,14 @@ ct add plugin some-plugin --target codex --global
 
 Codex plugin は `.codex-plugin/plugin.json` が必要。`ct` が生成・更新する marketplace は `ct-local` という名前で管理される。既存の marketplace が `ct-local` でない場合、上書きを避けるためエラーになる。
 
-インストール済み一覧も target を指定できる。
+Codex target の配置先は以下のとおり。
+
+| 種別 | project | global |
+|------|---------|--------|
+| skill | `.agents/skills/<name>` | `~/.agents/skills/<name>` |
+| plugin | `plugins/<name>` + `.agents/plugins/marketplace.json` | `~/.codex/plugins/<name>` + `~/.agents/plugins/marketplace.json` |
+
+インストール済み一覧、同期、削除も target を指定できる。
 
 ```bash
 ct list --installed --target codex
